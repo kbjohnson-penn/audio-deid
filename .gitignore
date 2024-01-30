@@ -138,3 +138,5 @@ cython_debug/
 
 # PHI data
 json_philtered
+*.json
+output/
