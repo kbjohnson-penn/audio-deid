@@ -44,4 +44,4 @@ The script is executed from the command line and requires four arguments:
 python scrub.py --source <source_video_path> --json <json_file_path> --output <output_audio_path> [--log]
 ```
 
-Replace <source_video_path>, <json_file_path>, and <output_audio_path> with the paths to your source video file, JSON file, and output audio file, respectively. Include --log if you want to enable logging.
+Replace **<source_video_path>**, **<json_file_path>**, and **<output_audio_path>** with the paths to your source video file, JSON file, and output audio file, respectively. Include **--log** if you want to enable logging.
