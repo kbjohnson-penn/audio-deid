@@ -3,7 +3,11 @@ import json
 import logging
 from datetime import datetime
 import pandas as pd
+import warnings
 from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_audioclips
+
+# Ignore warnings related to regex pattern
+warnings.filterwarnings("ignore", 'This pattern is interpreted as a regular expression')
 
 # Regular expression pattern to identify words enclosed with double asterisks
 pattern = r'\*\*(\w+)\*\*'
