@@ -3,15 +3,7 @@ import json
 import logging
 from datetime import datetime
 import pandas as pd
-import warnings
-from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_audioclips
-
-# Ignore warnings related to regex pattern
-warnings.filterwarnings(
-    "ignore", 'This pattern is interpreted as a regular expression')
-
-# Regular expression pattern to identify words enclosed with double asterisks
-pattern = r'\*\*(\w+)\*\*'
+from pydub import AudioSegment
 
 
 def get_start_end_timestamps(philtered_json):
@@ -37,7 +29,7 @@ def get_start_end_timestamps(philtered_json):
 
         # Filter rows that contain the pattern
         filtered_df = word_segments_df[word_segments_df['word'].str.contains(
-            pattern, regex=True, na=False)]
+            r'\*\*\w+\*\*', regex=True, na=False)]
 
         # Convert filtered data to list of dictionaries
         filtered_json = filtered_df[['start', 'end']].to_dict(orient='records')
@@ -57,79 +49,60 @@ def get_start_end_timestamps(philtered_json):
         raise
 
 
-def scrub_audio(source_video_path, time_intervals, scrubbed_audio_path):
+def scrub_audio(source_audio_path, time_intervals, scrubbed_audio_path):
     """
     Scrub audio from a video file and replace with beeps.
 
     Parameters:
-        source_video_path (str): Path to the source video file.
-        time_intervals (list): List of dictionaries containing start and end times in minutes.
+        source_audio_path (str): Path to the source audio file.
+        time_intervals (list): List of dictionaries containing start and end times in milliseconds.
         scrubbed_audio_path (str): Path to the scrubbed audio file.
     """
     try:
-        video = VideoFileClip(source_video_path)
-        original_audio = video.audio
-        beep = AudioFileClip("beep.mp3")
+        audio = AudioSegment.from_file(source_audio_path)
+        beep = AudioSegment.from_file("beep.mp3")
 
-        logging.info('Loaded video and audio files')
+        logging.info('Loaded audio file')
 
-        audio_segments = []
+        segments = []
         last_end_time = 0
 
         for interval in time_intervals:
-            start_time = float(interval['start'])
-            end_time = float(interval['end'])
+            # Convert to milliseconds
+            start_time = int(float(interval['start']) * 1000)
+            # Convert to milliseconds
+            end_time = int(float(interval['end']) * 1000)
 
             logging.info(
                 'Processing interval: start_time=%s, end_time=%s', start_time, end_time)
 
+            # Add the audio segment before the interval
+            segments.append(audio[last_end_time:start_time])
+
             interval_duration = end_time - start_time
 
-            if last_end_time < start_time:
-                audio_segment = original_audio.subclip(
-                    last_end_time, start_time)
-                logging.info(
-                    'Audio segment duration before interval: %s', audio_segment.duration)
-                audio_segments.append(audio_segment)
-
-            beep_duration = beep.duration
-
-            if beep_duration < interval_duration:
-                loops = int(interval_duration // beep_duration) + 1
-                beep_to_add = concatenate_audioclips(
-                    [beep] * loops).subclip(0, interval_duration)
+            # Add the beep segment
+            if beep.duration_seconds * 1000 < interval_duration:
+                loops = (interval_duration //
+                         int(beep.duration_seconds * 1000)) + 1
+                beep_segment = beep * loops
+                beep_segment = beep_segment[:interval_duration]
             else:
-                beep_to_add = beep.subclip(0, interval_duration)
+                beep_segment = beep[:interval_duration]
 
-            logging.info('Beep segment duration: %s', beep_to_add.duration)
-            audio_segments.append(beep_to_add)
+            segments.append(beep_segment)
             last_end_time = end_time
 
             logging.info('Processed interval from %s to %s',
                          start_time, end_time)
 
-        if last_end_time < original_audio.duration:
-            audio_segment = original_audio.subclip(
-                last_end_time, original_audio.duration)
-            logging.info(
-                'Audio segment duration after last interval: %s', audio_segment.duration)
-            audio_segments.append(audio_segment)
+        # Add the audio segment after the last interval
+        segments.append(audio[last_end_time:])
 
-        modified_audio = concatenate_audioclips(audio_segments)
-
-        logging.info('Modified audio duration: %s', modified_audio.duration)
-
-        if modified_audio.duration != modified_audio.duration:  # NaN check
-            raise ValueError(
-                "Modified audio duration is NaN. Please check the source file and intervals.")
-
-        modified_audio.write_audiofile(scrubbed_audio_path)
+        scrubbed_audio = sum(segments)
+        scrubbed_audio.export(scrubbed_audio_path, format="mp3")
 
         logging.info('Saved scrubbed audio to %s', scrubbed_audio_path)
-
-        video.close()
-        original_audio.close()
-        modified_audio.close()
 
     except Exception as e:
         logging.error('Error occurred while scrubbing audio: %s', e)
@@ -137,10 +110,19 @@ def scrub_audio(source_video_path, time_intervals, scrubbed_audio_path):
 
 
 def main():
+    """
+    Parse command line arguments and run the scrub_audio function.
+
+    Parameters:
+        None
+
+    Returns:
+        None
+    """
     parser = argparse.ArgumentParser(
         description='Scrub audio from a video file and replace with beeps.')
     parser.add_argument('--source', required=True,
-                        help='Path to the source video file.')
+                        help='Path to the source audio file.')
     parser.add_argument('--json', required=True,
                         help='Path to the JSON file containing time intervals.')
     parser.add_argument('--output', required=True,
@@ -154,9 +136,11 @@ def main():
         logging.basicConfig(filename=log_filename, level=logging.INFO,
                             format='%(asctime)s - %(levelname)s - %(message)s')
 
+    # Get the start and end timestamps from the JSON file
     filtered_json = get_start_end_timestamps(args.json)
     logging.info('Filtered JSON: %s', filtered_json)
 
+    # Scrub the audio and write to file
     scrub_audio(args.source, filtered_json, args.output)
     logging.info('Audio scrub completed.')
 
