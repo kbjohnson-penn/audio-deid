@@ -45,13 +45,13 @@ def transform_json_schema(input_json_file):
 
 def get_start_end_timestamps(philtered_json):
     """
-    Extract start and end timestamps from the JSON data.
-    
-    Args:
-    philtered_json (dict): JSON data containing word segments.
-    
+    Extract start and end timestamps from a JSON file.
+
+    Parameters:
+        philtered_json (dict): JSON data already loaded as a dictionary.
+
     Returns:
-    list: List of dictionaries containing start and end timestamps.
+        list: List of dictionaries containing valid start and end timestamps.
     """
     try:
         # Check if "word_segments" exists and is a list
@@ -67,17 +67,18 @@ def get_start_end_timestamps(philtered_json):
         filtered_df = word_segments_df[word_segments_df['word'].str.contains(
             r'\*\*\w+\*\*', regex=True, na=False)]
 
-        # Convert filtered data to list of dictionaries
-        filtered_json = filtered_df[['start', 'end']].to_dict(orient='records')
+        # Ensure 'start' and 'end' columns are numeric and handle empty strings
+        filtered_df = filtered_df[filtered_df['start'].apply(lambda x: x != '') & filtered_df['end'].apply(lambda x: x != '')]
+        filtered_df['start'] = pd.to_numeric(filtered_df['start'], errors='coerce')
+        filtered_df['end'] = pd.to_numeric(filtered_df['end'], errors='coerce')
 
         # Filter out invalid intervals
         valid_intervals = [
-            interval for interval in filtered_json
-            if pd.notna(interval['start']) and pd.notna(interval['end']) and float(interval['start']) < float(interval['end'])
+            interval for interval in filtered_df[['start', 'end']].to_dict(orient='records')
+            if pd.notna(interval['start']) and pd.notna(interval['end']) and interval['start'] < interval['end']
         ]
 
-        logging.info('Converted filtered data to list of dictionaries')
-
+        logging.info('Converted filtered data to list of dictionaries with valid intervals')
         return valid_intervals
 
     except Exception as e:
@@ -119,11 +120,11 @@ def scrub_audio(source_path, time_intervals, scrubbed_audio_path, target_video_p
             logging.info('Loaded audio file.')
 
         # Check if beep file exists
-        if not os.path.isfile("beep.mp3"):
+        if not os.path.isfile("/cbica/home/mopidevs/workspace/projects/pipeline/audio-deid/beep.mp3"):
             raise FileNotFoundError("Beep file 'beep.mp3' not found.")
 
         # Load the beep sound
-        beep = AudioSegment.from_file("beep.mp3")
+        beep = AudioSegment.from_file("/cbica/home/mopidevs/workspace/projects/pipeline/audio-deid/beep.mp3")
 
         segments = []
         last_end_time = 0
