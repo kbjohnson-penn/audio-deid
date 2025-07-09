@@ -143,3 +143,10 @@ output/
 *.out
 *.err
 
+# Ignore every MP3…
+*.mp3
+# …but keep this one
+!beep.mp3
+
+#logs
+logs/

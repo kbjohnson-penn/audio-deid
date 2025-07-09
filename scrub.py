@@ -2,87 +2,112 @@ import argparse
 import json
 import logging
 from datetime import datetime
-import pandas as pd
 from pydub import AudioSegment
 import os
 from moviepy.editor import VideoFileClip, AudioFileClip
-import uuid
+import tempfile
+import re
+
+# Constants
+MS_PER_SECOND = 1000
+SUPPORTED_VIDEO_FORMATS = ('.mp4', '.avi', '.mov', '.mkv')
+SUPPORTED_AUDIO_FORMATS = ('.mp3', '.wav', '.m4a', '.flac')
+PHI_PATTERN = r'\*\*\w+\*\*'
+
 
 def transform_json_schema(input_json_file):
     """
     Transform the JSON schema to the expected format.
     
     Args:
-    input_json_file (str): Path to the input JSON file.
+        input_json_file (str): Path to the input JSON file.
     
     Returns:
-    transformed_data (dict): Transformed JSON data.
+        dict: Original JSON data with word_segments.
+    
+    Raises:
+        FileNotFoundError: If the JSON file doesn't exist.
+        json.JSONDecodeError: If the JSON is invalid.
+        KeyError: If required keys are missing.
     """
     try:
-        # Load the original JSON data
         with open(input_json_file, 'r') as f:
             original_data = json.load(f)
-
-        # Transform the data to the expected schema
-        transformed_data = {
-            "word_segments": []
-        }
-
-        word_segments = original_data.get("word_segments")
-        for word_segment in word_segments:
-            transformed_data["word_segments"].append({
-                "word": word_segments[word_segment].get("word", ""),
-                "start": word_segments[word_segment].get("start", ""),
-                "end": word_segments[word_segment].get("end", ""),
-                "score": word_segments[word_segment].get("score", ""),
-                "speaker": word_segments[word_segment].get("speaker", "")
-            })
-
-        return transformed_data
-
+        
+        # Check if word_segments exists
+        if "word_segments" not in original_data:
+            raise KeyError("Key 'word_segments' not found in JSON data.")
+        
+        # Return the original data - no transformation needed
+        return original_data
+    
     except Exception as e:
-        print(f"Error transforming JSON schema: {e}")
+        logging.error(f"Error loading JSON file: {e}")
+        raise
+
 
 def get_start_end_timestamps(philtered_json):
     """
-    Extract start and end timestamps from a JSON file.
-
+    Extract start and end timestamps from JSON data.
+    
     Parameters:
-        philtered_json (dict): JSON data already loaded as a dictionary.
-
+        philtered_json (dict): JSON data containing word_segments.
+    
     Returns:
         list: List of dictionaries containing valid start and end timestamps.
+    
+    Raises:
+        KeyError: If word_segments is not found.
     """
     try:
-        # Check if "word_segments" exists and is a list
+        # Check if "word_segments" exists
         if "word_segments" not in philtered_json:
             raise KeyError("Key 'word_segments' not found in JSON data.")
-
-        # Convert JSON data to DataFrame for easier manipulation
-        word_segments_df = pd.DataFrame(philtered_json["word_segments"])
-
-        print("Columns in DataFrame:", word_segments_df.columns)
         
-        # Filter rows that contain the pattern
-        filtered_df = word_segments_df[word_segments_df['word'].str.contains(
-            r'\*\*\w+\*\*', regex=True, na=False)]
-
-        # Ensure 'start' and 'end' columns are numeric and handle empty strings
-        filtered_df = filtered_df[filtered_df['start'].apply(lambda x: x != '') & filtered_df['end'].apply(lambda x: x != '')]
-        filtered_df['start'] = pd.to_numeric(filtered_df['start'], errors='coerce')
-        filtered_df['end'] = pd.to_numeric(filtered_df['end'], errors='coerce')
-
-        # Filter out invalid intervals
-        valid_intervals = [
-            interval for interval in filtered_df[['start', 'end']].to_dict(orient='records')
-            if pd.notna(interval['start']) and pd.notna(interval['end']) and interval['start'] < interval['end']
-        ]
-
-        logging.info('Converted filtered data to list of dictionaries with valid intervals')
+        word_segments = philtered_json["word_segments"]
+        valid_intervals = []
+        
+        # Process each word segment
+        for _, segment_data in word_segments.items():
+            word = segment_data.get('word', '')
+            
+            # Check if word contains PHI pattern
+            if re.search(PHI_PATTERN, word):
+                try:
+                    start = float(segment_data.get('start', 0))
+                    end = float(segment_data.get('end', 0))
+                    
+                    # Validate interval
+                    if start < end:
+                        interval = {
+                            'start': start,
+                            'end': end,
+                            'word': word
+                        }
+                        valid_intervals.append(interval)
+                        logging.debug('Added PHI interval: word="%s", start=%s, end=%s', 
+                                    word, start, end)
+                    else:
+                        logging.warning('Invalid interval for word "%s": start=%s >= end=%s', 
+                                      word, start, end)
+                except (ValueError, TypeError) as e:
+                    logging.warning('Failed to parse timestamps for word "%s": %s', word, e)
+        
+        # Sort intervals by start time and check for overlaps
+        valid_intervals.sort(key=lambda x: x['start'])
+        
+        # Check for overlapping intervals
+        for i in range(1, len(valid_intervals)):
+            if valid_intervals[i]['start'] < valid_intervals[i-1]['end']:
+                logging.warning('Overlapping intervals detected: [%s-%s] and [%s-%s]',
+                              valid_intervals[i-1]['start'], valid_intervals[i-1]['end'],
+                              valid_intervals[i]['start'], valid_intervals[i]['end'])
+        
+        logging.info('Found %d valid PHI intervals to scrub', len(valid_intervals))
         return valid_intervals
-
+    
     except Exception as e:
-        logging.error('Error occurred while loading JSON data: %s', e)
+        logging.error('Error occurred while processing JSON data: %s', e)
         raise
 
 
@@ -91,127 +116,157 @@ def scrub_audio(source_path, time_intervals, scrubbed_audio_path, target_video_p
     Scrub audio from an audio or video file and replace segments with beeps.
     
     Args:
-    source_path (str): Path to the source audio or video file.
-    time_intervals (list): List of dictionaries containing start and end timestamps.
-    scrubbed_audio_path (str): Path to the scrubbed audio or video file.
-    target_video_path (str): Path to a different video file to reattach the scrubbed audio.
+        source_path (str): Path to the source audio or video file.
+        time_intervals (list): List of dictionaries containing start and end timestamps.
+        scrubbed_audio_path (str): Path to the scrubbed audio or video file.
+        target_video_path (str): Path to a different video file to reattach the scrubbed audio.
     
     Raises:
-    FileNotFoundError: If the beep file is not found.
-    ValueError: If the scrubbed_audio_path does not have a video-compatible extension.
+        FileNotFoundError: If the beep file is not found.
+        ValueError: If the scrubbed_audio_path does not have a video-compatible extension.
+        RuntimeError: If video has no audio track.
     """
+    # Use system temp directory for temporary files
+    with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_audio:
+        temp_audio_file = temp_audio.name
+    
+    with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_scrubbed:
+        temp_scrubbed_audio_file = temp_scrubbed.name
+    
     try:
-        # Generate unique filenames for temporary files
-        temp_audio_file = f"temp_audio_{uuid.uuid4()}.mp3"
-        temp_scrubbed_audio_file = f"temp_scrubbed_audio_{uuid.uuid4()}.mp3"
-
         # Check if the source is a video
-        is_video = source_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))
+        is_video = source_path.lower().endswith(SUPPORTED_VIDEO_FORMATS)
         audio = None
-
+        
         # Load audio from video or audio file
         if is_video:
             with VideoFileClip(source_path) as video:
-                video.audio.write_audiofile(temp_audio_file, codec="mp3")
+                if video.audio is None:
+                    raise RuntimeError(f"Video file '{source_path}' has no audio track.")
+                video.audio.write_audiofile(temp_audio_file, codec="mp3", verbose=False, logger=None)
                 audio = AudioSegment.from_file(temp_audio_file)
                 logging.info('Loaded video and extracted audio.')
         else:
             audio = AudioSegment.from_file(source_path)
             logging.info('Loaded audio file.')
-
+        
         # Check if beep file exists
-        if not os.path.isfile("/cbica/home/mopidevs/workspace/projects/pipeline/audio-deid/beep.mp3"):
-            raise FileNotFoundError("Beep file 'beep.mp3' not found.")
-
+        beep_path = os.path.join(os.path.dirname(__file__), "beep.mp3")
+        if not os.path.isfile(beep_path):
+            raise FileNotFoundError(f"Beep file 'beep.mp3' not found at {beep_path}")
+        
         # Load the beep sound
-        beep = AudioSegment.from_file("/cbica/home/mopidevs/workspace/projects/pipeline/audio-deid/beep.mp3")
-
-        segments = []
+        beep = AudioSegment.from_file(beep_path)
+        
+        # Use empty AudioSegment and concatenate (more memory efficient)
+        scrubbed_audio = AudioSegment.empty()
         last_end_time = 0
-
-        for interval in time_intervals:
+        
+        for i, interval in enumerate(time_intervals):
             # Convert start and end times to milliseconds
-            start_time = int(float(interval['start']) * 1000)
-            end_time = int(float(interval['end']) * 1000)
-
+            start_time = int(interval['start'] * MS_PER_SECOND)
+            end_time = int(interval['end'] * MS_PER_SECOND)
+            
+            # Sanitize PHI word for logging
+            sanitized_word = re.sub(r'\*\*(\w+)\*\*', r'**[REDACTED]**', interval.get('word', 'N/A'))
+            
             logging.info(
-                'Processing interval: start_time=%s, end_time=%s', start_time, end_time)
-
+                'Processing interval %d/%d: [%.3fs-%.3fs], PHI type=%s', 
+                i + 1, len(time_intervals), interval['start'], interval['end'], 
+                sanitized_word)
+            
             # Add the audio segment before the interval
-            segments.append(audio[last_end_time:start_time])
-
+            if start_time > last_end_time:
+                scrubbed_audio += audio[last_end_time:start_time]
+            
             interval_duration = end_time - start_time
-
-            # Add the beep segment
-            if beep.duration_seconds * 1000 < interval_duration:
-                loops = (interval_duration //
-                         int(beep.duration_seconds * 1000)) + 1
+            
+            # Create beep segment of appropriate length
+            if beep.duration_seconds * MS_PER_SECOND < interval_duration:
+                loops = (interval_duration // int(beep.duration_seconds * MS_PER_SECOND)) + 1
                 beep_segment = beep * loops
                 beep_segment = beep_segment[:interval_duration]
             else:
                 beep_segment = beep[:interval_duration]
-
-            segments.append(beep_segment)
+            
+            scrubbed_audio += beep_segment
             last_end_time = end_time
-
+        
         # Add the remaining audio after the last interval
-        segments.append(audio[last_end_time:])
-
-        # Concatenate all segments
-        scrubbed_audio = sum(segments)
-
-        # Export scrubbed audio to a unique temporary file
+        if last_end_time < len(audio):
+            scrubbed_audio += audio[last_end_time:]
+        
+        # Export scrubbed audio to temporary file
         scrubbed_audio.export(temp_scrubbed_audio_file, format="mp3")
-
+        
         # If a target video path is provided, reattach the scrubbed audio to it
         if target_video_path:
             with VideoFileClip(target_video_path) as target_video:
-                scrubbed_audio_clip = AudioFileClip(temp_scrubbed_audio_file)
-                target_video = target_video.set_audio(scrubbed_audio_clip)
-
-                # Check that output path has a video-compatible extension
-                if not scrubbed_audio_path.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
-                    raise ValueError("scrubbed_audio_path should have a video-compatible extension like .mp4 or .mov")
-
-                # Write the final video with audio
-                target_video.write_videofile(
-                    scrubbed_audio_path, codec="libx264", audio_codec="aac"
-                )
-                logging.info('Saved scrubbed video with reattached audio to %s', scrubbed_audio_path)
+                # Use context manager for AudioFileClip to prevent resource leak
+                with AudioFileClip(temp_scrubbed_audio_file) as scrubbed_audio_clip:
+                    final_video = target_video.set_audio(scrubbed_audio_clip)
+                    
+                    # Check that output path has a video-compatible extension
+                    if not scrubbed_audio_path.lower().endswith(SUPPORTED_VIDEO_FORMATS):
+                        raise ValueError(
+                            f"Output path should have a video-compatible extension "
+                            f"like {', '.join(SUPPORTED_VIDEO_FORMATS)}")
+                    
+                    # Write the final video with audio
+                    final_video.write_videofile(
+                        scrubbed_audio_path, codec="libx264", audio_codec="aac",
+                        verbose=False, logger=None
+                    )
+            logging.info('Saved scrubbed video with reattached audio to %s', scrubbed_audio_path)
         else:
             # If no target video path, save scrubbed audio directly
             scrubbed_audio.export(scrubbed_audio_path, format="mp3")
             logging.info('Saved scrubbed audio to %s', scrubbed_audio_path)
-
-        # Clean up temporary files
-        os.remove(temp_audio_file)
-        os.remove(temp_scrubbed_audio_file)
-
+    
     except Exception as e:
         logging.error('Error occurred while scrubbing audio: %s', e)
         raise
+    finally:
+        # Clean up temporary files
+        for temp_file in [temp_audio_file, temp_scrubbed_audio_file]:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                    logging.debug('Removed temporary file: %s', temp_file)
+                except OSError as e:
+                    logging.warning('Failed to remove temporary file %s: %s', temp_file, e)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Scrub audio from an audio or video file and replace segments with beeps.')
+        description='Scrub audio from an audio or video file and replace PHI segments with beeps.')
     parser.add_argument('--source', required=True,
                         help='Path to the source audio or video file.')
     parser.add_argument('--json', required=True,
-                        help='Path to the JSON file containing time intervals.')
+                        help='Path to the JSON file containing PHI time intervals.')
     parser.add_argument('--output', required=True,
                         help='Path to the scrubbed audio or video file.')
     parser.add_argument(
         '--target_video', help='Path to a different video file to reattach the scrubbed audio.')
-    parser.add_argument('--log', action='store_true', help='Enable logging.')
-
+    parser.add_argument('--log', action='store_true', help='Enable detailed logging.')
+    
     args = parser.parse_args()
-
+    
+    # Configure logging
     if args.log:
-        log_filename = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        # Create logs directory if it doesn't exist
+        logs_dir = os.path.join(os.path.dirname(__file__), 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        
+        log_filename = os.path.join(logs_dir, f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
         logging.basicConfig(filename=log_filename, level=logging.INFO,
                             format='%(asctime)s - %(levelname)s - %(message)s')
-
+        logging.info('Starting audio scrubbing process')
+    else:
+        # Set up basic logging to avoid errors when logging is called
+        logging.basicConfig(level=logging.WARNING,
+                            format='%(asctime)s - %(levelname)s - %(message)s')
+    
     # Validate paths
     if not os.path.isfile(args.source):
         raise FileNotFoundError(f"Source file '{args.source}' not found.")
@@ -219,17 +274,30 @@ def main():
         raise FileNotFoundError(f"JSON file '{args.json}' not found.")
     if args.target_video and not os.path.isfile(args.target_video):
         raise FileNotFoundError(f"Target video file '{args.target_video}' not found.")
-
-    # Transform the JSON schema
-    transformed_json = transform_json_schema(args.json)
     
-    # Get the start and end timestamps from the JSON file
-    filtered_json = get_start_end_timestamps(transformed_json)
-    logging.info('Filtered JSON: %s', filtered_json)
-
-    # Scrub the audio and write to file
-    scrub_audio(args.source, filtered_json, args.output, args.target_video)
-    logging.info('Audio scrub completed.')
+    try:
+        # Load and process JSON data
+        json_data = transform_json_schema(args.json)
+        
+        # Get the start and end timestamps from the JSON file
+        filtered_intervals = get_start_end_timestamps(json_data)
+        
+        if not filtered_intervals:
+            logging.warning('No PHI intervals found in the JSON file.')
+            print("Warning: No PHI intervals found in the JSON file.")
+        else:
+            # Log summary without exposing PHI
+            logging.info('Processing %d PHI intervals', len(filtered_intervals))
+            
+            # Scrub the audio and write to file
+            scrub_audio(args.source, filtered_intervals, args.output, args.target_video)
+            logging.info('Audio scrub completed successfully.')
+            print(f"Audio scrubbing completed. Output saved to: {args.output}")
+    
+    except Exception as e:
+        logging.error('Failed to complete audio scrubbing: %s', e)
+        print(f"Error: {e}")
+        raise
 
 
 if __name__ == "__main__":
